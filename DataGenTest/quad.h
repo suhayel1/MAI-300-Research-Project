@@ -1,0 +1,167 @@
+#ifndef QUAD_H
+#define QUAD_H
+
+#include "hittable.h"
+#include "hittable_list.h"
+
+class quad : public hittable {
+  public:
+    __device__ quad(const point3& Q, const vec3& u, const vec3& v, material* mat)
+      : Q(Q), u(u), v(v), mat(mat)
+    {
+        auto n = cross(u, v);
+        normal = unit_vector(n);
+        D = dot(normal, Q);
+        w = n / dot(n,n);
+
+        area = n.length();
+
+        set_bounding_box();
+    }
+
+    // No destructor: materials are shared and freed once in free_world.
+
+    __device__ virtual void set_bounding_box() {
+        // Compute the bounding box of all four vertices.
+        auto bbox_diagonal1 = aabb(Q, Q + u + v);
+        auto bbox_diagonal2 = aabb(Q + u, Q + v);
+        bbox = aabb(bbox_diagonal1, bbox_diagonal2);
+    }
+
+    __device__ aabb bounding_box() const override { return bbox; }
+
+    __device__ bool hit(const ray& r, interval ray_t, hit_record& rec, curandState* state) const override {
+        auto denom = dot(normal, r.direction());
+
+        // No hit if the ray is parallel to the plane.
+        if (std::fabs(denom) < 1e-8f)
+            return false;
+
+        // Return false if the hit point parameter t is outside the ray interval.
+        auto t = (D - dot(normal, r.origin())) / denom;
+        if (!ray_t.contains(t))
+            return false;
+
+        // Determine if the hit point lies within the planar shape using its plane coordinates.
+        auto intersection = r.at(t);
+        vec3 planar_hitpt_vector = intersection - Q;
+        auto alpha = dot(w, cross(planar_hitpt_vector, v));
+        auto beta = dot(w, cross(u, planar_hitpt_vector));
+
+        if (!is_interior(alpha, beta, rec))
+            return false;
+
+        // Ray hits the 2D shape; set the rest of the hit record and return true.
+        rec.t = t;
+        rec.p = intersection;
+        rec.mat = mat;
+        rec.set_face_normal(r, normal);
+
+        return true;
+    }
+
+    __device__ virtual bool is_interior(float a, float b, hit_record& rec) const {
+        interval unit_interval = interval(0, 1);
+        // Given the hit point in plane coordinates, return false if it is outside the
+        // primitive, otherwise set the hit record UV coordinates and return true.
+
+        if (!unit_interval.contains(a) || !unit_interval.contains(b))
+            return false;
+
+        rec.u = a;
+        rec.v = b;
+        return true;
+    }
+
+    __device__ float pdf_value(const point3& origin, const vec3& direction) const override {
+        hit_record rec;
+        if (!this->hit(ray(origin, direction), interval(0.001f, infinity), rec, nullptr))
+            return 0;
+
+        auto distance_squared = rec.t * rec.t * direction.length_squared();
+        auto cosine = std::fabs(dot(direction, rec.normal) / direction.length());
+
+        return distance_squared / (cosine * area);
+    }
+
+    __device__ vec3 random(const point3& origin, curandState* state) const override {
+        auto p = Q + (random_float(state) * u) + (random_float(state) * v);
+        return p - origin;
+    }
+
+  private:
+    point3 Q;
+    vec3 u, v;
+    vec3 w;
+    material* mat;
+    aabb bbox;
+    vec3 normal;
+    float D;
+    float area;
+};
+
+// Returns the 3D box (six sides) that contains the two opposite vertices a & b.
+// The caller owns the returned list (deleting it deletes the six quads).
+__device__ inline hittable_list* box(const point3& a, const point3& b, material* mat)
+{
+    auto sides = new hittable_list();
+
+    // Construct the two opposite vertices with the minimum and maximum coordinates.
+    auto min = point3(std::fmin(a.x(),b.x()), std::fmin(a.y(),b.y()), std::fmin(a.z(),b.z()));
+    auto max = point3(std::fmax(a.x(),b.x()), std::fmax(a.y(),b.y()), std::fmax(a.z(),b.z()));
+
+    auto dx = vec3(max.x() - min.x(), 0, 0);
+    auto dy = vec3(0, max.y() - min.y(), 0);
+    auto dz = vec3(0, 0, max.z() - min.z());
+
+    sides->add(new quad(point3(min.x(), min.y(), max.z()),  dx,  dy, mat)); // front
+    sides->add(new quad(point3(max.x(), min.y(), max.z()), -dz,  dy, mat)); // right
+    sides->add(new quad(point3(max.x(), min.y(), min.z()), -dx,  dy, mat)); // back
+    sides->add(new quad(point3(min.x(), min.y(), min.z()),  dz,  dy, mat)); // left
+    sides->add(new quad(point3(min.x(), max.y(), max.z()),  dx, -dz, mat)); // top
+    sides->add(new quad(point3(min.x(), min.y(), min.z()),  dx,  dz, mat)); // bottom
+
+    return sides;
+}
+
+// Triangle with corners Q, Q+u, Q+v. Same plane maths as quad; only the inside test differs.
+class tri : public quad {
+  public:
+    __device__ tri(const point3& Q, const vec3& u, const vec3& v, material* mat)
+      : quad(Q, u, v, mat) {}
+
+    __device__ bool is_interior(float a, float b, hit_record& rec) const override {
+        if (a < 0 || b < 0 || a + b > 1)
+            return false;
+
+        rec.u = a;
+        rec.v = b;
+        return true;
+    }
+};
+
+// Square pyramid: base centred at base_center, base side 2*half_width,
+// apex `height` above the centre. Every face's normal points outward
+// (needed for glass). The caller owns the returned list.
+__device__ inline hittable_list* pyramid(const point3& base_center, float half_width,
+                                         float height, material* mat) {
+    auto faces = new hittable_list();
+    float h = half_width;
+    point3 c = base_center;
+
+    point3 p0(c.x() - h, c.y(), c.z() - h);
+    point3 p1(c.x() + h, c.y(), c.z() - h);
+    point3 p2(c.x() + h, c.y(), c.z() + h);
+    point3 p3(c.x() - h, c.y(), c.z() + h);
+    point3 apex(c.x(), c.y() + height, c.z());
+
+    faces->add(new quad(p0, p1 - p0, p3 - p0, mat));    // base  (faces down)
+    faces->add(new tri(p0, apex - p0, p1 - p0, mat));   // front (-z)
+    faces->add(new tri(p1, apex - p1, p2 - p1, mat));   // right (+x)
+    faces->add(new tri(p2, apex - p2, p3 - p2, mat));   // back  (+z)
+    faces->add(new tri(p3, apex - p3, p0 - p3, mat));   // left  (-x)
+
+    return faces;
+}
+
+#endif
